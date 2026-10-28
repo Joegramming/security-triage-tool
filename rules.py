@@ -227,10 +227,13 @@ def annotate_git_dirs(entries: list[Entry]) -> None:
         if not e.is_dir and e.parts:
             children[fid].add(e.parts[-1])
         chains.append(chain)
-    # git's own signatures: objects/ + refs/ (a common dir, where hooks live, needs no HEAD), or HEAD + commondir
+    # git's own signatures: objects + refs (a common dir, where hooks live, needs no HEAD), or HEAD + commondir
     # (a worktree-style gitdir pointing at that common dir). Config is optional; .git/logs (HEAD + refs/) is not one.
+    # objects and refs may be plain files: Git for Windows only checks that they exist (verified with git 2.54).
+    def has(c, name):
+        return name in c or name + "/" in c
     git = {fid for fid, c in children.items()
-           if names[fid] == ".git" or "objects/" in c and "refs/" in c or "head" in c and "commondir" in c}
+           if names[fid] == ".git" or has(c, "objects") and has(c, "refs") or "head" in c and "commondir" in c}
     for e, chain in zip(entries, chains):
         e.git_depth = max((depth for depth, fid in enumerate(chain) if fid in git), default=None)
 

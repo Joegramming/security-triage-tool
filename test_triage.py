@@ -103,6 +103,12 @@ def test_git_dir_signatures_match_git():
     assert has(f, HIGH, "wt/", "bare git repository") and has(f, HIGH, "common/", "bare git repository")
     assert has(f, HIGH, "common/hooks/post-checkout", "hook")
     assert not any(x.path == "r/.git/logs/" for x in f)  # HEAD + refs/ alone is git's log folder, not a repo
+    # Git for Windows 2.54 accepted these as repositories (refs or objects as a plain file) and rejected the last
+    f = scan({"a/HEAD": "ref", "a/objects/x": "", "a/refs": "", "a/hooks/post-checkout": "echo test",
+              "b/HEAD": "ref", "b/objects": "", "b/refs/heads/main": "x", "b/hooks/post-merge": "echo test",
+              "c/HEAD": "ref", "c/config": "[core]\n\tfsmonitor = x\n", "c/objects/x": ""})
+    assert has(f, HIGH, "a/hooks/post-checkout", "hook") and has(f, HIGH, "b/hooks/post-merge", "hook")
+    assert not any(x.path.startswith("c/") for x in f)  # no refs at all: git refuses it, so its config never runs
 
 
 def test_dangerous_git_config():
