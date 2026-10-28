@@ -2,6 +2,7 @@
 attack patterns; nothing here is ever extracted or executed."""
 import io
 import json
+import re
 import struct
 import time
 import zipfile
@@ -319,6 +320,23 @@ def test_text_patterns_stay_fast_on_crafted_repetition():
     scan({"a.txt": "curl " * 200_000, "b.txt": "powershell " * 100_000, "c.txt": ("A" * 299 + " ") * 10_000,
           "d.txt": "curl|" * 200_000, "e.txt": "bash " * 200_000})
     assert time.perf_counter() - start < 5
+
+
+def test_every_regex_stays_fast_on_crafted_input():
+    # Catches quadratic patterns automatically, including ones added later: before the fix, an .npmrc of
+    # 20,000 blank lines took 5 s. Each input is ~100 KB, so a quadratic pattern takes far longer than the limit.
+    patterns = [v for v in vars(rules).values() if isinstance(v, re.Pattern)]
+    patterns += [v for d in vars(rules).values() if isinstance(d, dict) for v in d.values() if isinstance(v, re.Pattern)]
+    words = "curl wget bash sh sudo powershell pwsh iex node python py atob eval hooks yarnPath script-shell folderOpen"
+    inputs = ["\n" * 100_000, " " * 100_000, "\t\n" * 50_000, "a" * 100_000, "A" * 299 + " " * 50_000, "|" * 100_000,
+              "\\\\" * 50_000, "//a" * 30_000, ("curl|" * 20_000), " -a" * 30_000, "[core]" * 15_000]
+    inputs += [(w + " ") * (100_000 // (len(w) + 1)) for w in words.split()]
+    assert len(patterns) > 15  # sanity: the module scan found the patterns
+    for rx in patterns:
+        for text in inputs:
+            start = time.perf_counter()
+            rx.search(text)
+            assert time.perf_counter() - start < 1, (rx.pattern[:60], text[:20])
 
 
 def test_hostile_layouts_stay_fast():

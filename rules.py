@@ -45,11 +45,12 @@ DECOY_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt",
 UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 BIDI_CHARS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f")
 NPM_LIFECYCLE_SCRIPTS = {"preinstall", "install", "postinstall", "prepare"}
-# Package-manager config keys that run a program on every command or install (file name -> key pattern)
+# Package-manager config keys that run a program on every command or install (file name -> key pattern).
+# [ \t]* not \s*: with re.M, \s* crosses newlines, so every line start would rescan all following blank lines.
 PACKAGE_MANAGER_RUNNERS = {
-    ".yarnrc.yml": re.compile(r"^\s*(yarnPath|plugins)\s*:", re.M | re.I),
-    ".yarnrc": re.compile(r"^\s*(yarn-path)\b", re.M | re.I),
-    ".npmrc": re.compile(r"^\s*(script-shell|node-options|onload-script)\s*=", re.M | re.I),
+    ".yarnrc.yml": re.compile(r"^[ \t]*(yarnPath|plugins)[ \t]*:", re.M | re.I),
+    ".yarnrc": re.compile(r"^[ \t]*(yarn-path)\b", re.M | re.I),
+    ".npmrc": re.compile(r"^[ \t]*(script-shell|node-options|onload-script)[ \t]*=", re.M | re.I),
 }
 
 # (section, key) -> why it's dangerous. key "*" matches any key in that section.
@@ -120,8 +121,9 @@ AGENT_COMMAND_KEYS_RE = re.compile(
     r"""|toolDiscoveryCommand|toolCallCommand)["']?\s*[:=]""", re.I)
 JSON_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 SHORT_NAME_RE = re.compile(r"[^.~]{1,6}~\d{1,6}(\.[^.]{0,3})?")  # 8.3 short name: up to 6 chars, ~N, optional 3-char ext
-GIT_SECTION_RE = re.compile(r'\s*\[\s*([^\]\s"]+)\s*(?:"(?:[^"\\]|\\.)*")?\s*\](.*)')
-GIT_KEY_RE = re.compile(r"\s*([A-Za-z][\w-]*)\s*(?:=\s*(.*)|[;#].*)?$")
+# Anchored with ^: used with .match() per line anyway, and this keeps them linear even under .search()
+GIT_SECTION_RE = re.compile(r'^\s*\[\s*([^\]\s"]+)\s*(?:"(?:[^"\\]|\\.)*")?\s*\](.*)')
+GIT_KEY_RE = re.compile(r"^\s*([A-Za-z][\w-]*)\s*(?:=\s*(.*)|[;#].*)?$")
 
 
 # --- Model -------------------------------------------------------------------
