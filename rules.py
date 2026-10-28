@@ -40,6 +40,12 @@ DECOY_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt",
 UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 BIDI_CHARS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f")
 NPM_LIFECYCLE_SCRIPTS = {"preinstall", "install", "postinstall", "prepare"}
+# Package-manager config keys that run a program on every command or install (file name -> key pattern)
+PACKAGE_MANAGER_RUNNERS = {
+    ".yarnrc.yml": re.compile(r"^\s*(yarnPath|plugins)\s*:", re.M | re.I),
+    ".yarnrc": re.compile(r"^\s*(yarn-path)\b", re.M | re.I),
+    ".npmrc": re.compile(r"^\s*(script-shell|node-options|onload-script)\s*=", re.M | re.I),
+}
 
 # (section, key) -> why it's dangerous. key "*" matches any key in that section.
 # Aliases starting with "!" are handled in git_config() because they depend on the value.
@@ -105,6 +111,7 @@ AGENT_RUN_RE = re.compile(
 FOLDER_OPEN_RE = re.compile(r'"folderOpen"', re.I)
 HOOKS_RE = re.compile(r"""["']?hooks["']?\s*[:=]""", re.I)
 JSON_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+SHORT_NAME_RE = re.compile(r"[^.~]{1,6}~\d{1,6}(\.[^.]{0,3})?")  # 8.3 short name: up to 6 chars, ~N, optional 3-char ext
 GIT_SECTION_RE = re.compile(r'\s*\[\s*([^\]\s"]+)\s*(?:"(?:[^"\\]|\\.)*")?\s*\](.*)')
 GIT_KEY_RE = re.compile(r"\s*([A-Za-z][\w-]*)\s*(?:=\s*(.*)|[;#].*)?$")
 
@@ -120,8 +127,9 @@ class Finding:
 
 
 def norm_part(part: str) -> str:
-    """Normalize a path part the way Windows resolves it: case-insensitive, trailing dots/spaces ignored, GIT~1 = .git."""
-    n = part.lower().rstrip(" .") or part
+    """Normalize a path part the way Windows resolves it: case-insensitive, trailing dots/spaces ignored, GIT~1 = .git,
+    and NTFS stream syntax dropped (".vscode::$INDEX_ALLOCATION" is the .vscode folder itself)."""
+    n = part.lower().split(":", 1)[0].rstrip(" .") or part
     return ".git" if re.fullmatch(r"git~\d+", n) else n
 
 
@@ -255,6 +263,17 @@ def path_traversal(e):
 
 
 @rule
+def windows_path_tricks(e):
+    short = next((raw for raw, part in zip(e.raw_parts, e.parts) if SHORT_NAME_RE.fullmatch(part)), None)
+    if short:
+        yield Finding(HIGH, f"Windows 8.3 short name {short!r}: once the real folder exists, Windows can resolve this "
+                            "to it (e.g. VSCODE~1 = .vscode), so files land in folders the other rules watch")
+    if ":" in e.path:
+        yield Finding(HIGH, "Colon in the name: NTFS stream syntax can name a folder itself "
+                            "(.vscode::$INDEX_ALLOCATION = .vscode), or a drive")
+
+
+@rule
 def symlink(e):
     if e.is_symlink:
         yield Finding(HIGH, f"Symbolic link to {(e.text or '?')[:200]!r}: unzip on WSL, macOS or Linux creates it, "
@@ -367,6 +386,16 @@ def npm_lifecycle_scripts(e):
     if found:
         listed = "; ".join(f"{k}: {str(v)[:80]}" for k, v in found.items())
         yield Finding(MEDIUM, f"npm lifecycle script, runs automatically on npm install: {listed}")
+
+
+@rule
+def package_manager_configs(e):
+    if e.is_dir:
+        return
+    if e.name in (".pnpmfile.cjs", ".pnpmfile.mjs"):
+        yield Finding(MEDIUM, f"{e.name}: pnpm runs this code on every install")
+    elif (rx := PACKAGE_MANAGER_RUNNERS.get(e.name)) and e.text and (m := rx.search(e.text)):
+        yield Finding(MEDIUM, f"{e.name} sets {m[1]!r}: runs a program on every package-manager command")
 
 
 @rule

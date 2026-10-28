@@ -154,14 +154,21 @@ def scan_joined_archive(zf, infos, scan, label, prefix, depth):
     start = min((i.header_offset for i in infos), default=0)
     if start == 0 or scan.capped:
         return
+    if start > MAX_FILE_BYTES:  # reading only part of it would hide a front archive without a trace
+        scan.add(Finding(HIGH, f"Over {MAX_FILE_BYTES // 2**20} MiB of data in front of the archive: not inspected "
+                               "(could be another archive that some tools show instead)", label))
+        return
     zf.fp.seek(0)
-    head = zf.fp.read(min(start, MAX_FILE_BYTES))
+    head = zf.fp.read(start)
     scan.bytes_read += len(head)
     if zipfile.is_zipfile(io.BytesIO(head)):
-        scan.add(Finding(HIGH, "Two zip archives joined into one file: tools disagree on which one they show, "
-                               "so the first one is scanned too (its findings are listed under (first archive)!/)", label))
+        scan.add(Finding(HIGH, "Two zip archives joined into one file: tools disagree on which one they show "
+                               "(the first one's findings are listed under (first archive)!/)", label))
         if depth < MAX_DEPTH:
             scan_zip(io.BytesIO(head), scan, label + " (first archive)", prefix + "(first archive)!/", depth + 1)
+        else:
+            scan.add(Finding(HIGH, f"Joined archives more than {MAX_DEPTH} levels deep: the first one was not scanned, "
+                                   "contents unknown", label))
 
 
 def check_did_not_run(scan, label, note):
