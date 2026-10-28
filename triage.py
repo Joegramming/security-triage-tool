@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 import struct
 import subprocess
@@ -29,6 +30,7 @@ MAX_FILE_BYTES = 50 * 2**20    # content read per entry
 MAX_ENTRIES = 20_000           # per run, nested archives included (per archive would multiply with nesting)
 MAX_DEPTH = 3                  # nested zips
 COLLAPSE_AT = 5                # text report: more findings than this with the same reason become one line
+QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")  # quoted parts of a reason (names, link targets, quoted lines)
 DISCLAIMER = "No findings does not mean safe. Never open repos received as files; fresh-clone from a GitHub link instead."
 
 
@@ -260,13 +262,13 @@ def render_text(report: dict) -> str:
         group = [f for f in report["findings"] if f["severity"] == sev]
         if not group:
             continue
-        by_reason = {}
+        by_reason = {}  # grouped by reason with quoted parts blanked: those hold attacker-chosen text
         for f in group:
-            by_reason.setdefault(f["reason"], []).append(f)
+            by_reason.setdefault(QUOTED_RE.sub("'...'", f["reason"]), []).append(f)
         out += ["", f"{sev} ({len(group)})"]
-        # Individual findings first: hundreds of identical ".js" lines must not bury a git hook below them
+        # Individual findings first: hundreds of ".js" lines (or 2,000 crafted symlinks) must not bury a git hook
         for f in group:
-            if len(by_reason[f["reason"]]) <= COLLAPSE_AT:
+            if len(by_reason[QUOTED_RE.sub("'...'", f["reason"])]) <= COLLAPSE_AT:
                 out += [f"  {printable(f['path'])}", f"      {printable(f['reason'])}"]
                 if f["sha256"]:
                     out.append(f"      sha256 {f['sha256']}")

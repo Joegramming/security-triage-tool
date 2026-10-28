@@ -116,9 +116,12 @@ KEYWORD_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s"})
 # run something is prompt injection. Names are matched lowercased; dirs as path fragments.
 AGENT_INSTRUCTION_NAMES = {"claude.md", "claude.local.md", "agents.md", "gemini.md", ".windsurfrules", ".clinerules"}
 AGENT_INSTRUCTION_PATHS = ("/.github/copilot-instructions.md", "/.github/instructions/", "/.clinerules/", "/.windsurf/rules/")
+# Spans lines (bounded, so still linear): "Run:" followed by a code block is the normal way to write an instruction
 AGENT_RUN_RE = re.compile(
-    r"\b(run|execute|exec|invoke|launch)\b[^\n]{0,60}"
-    r"\b(command|script|shell|terminal|bash|cmd|powershell|pwsh|curl|wget|npm|npx|node|python)\b", re.I)
+    r"\b(run|execute|exec|invoke|launch)\b[\s\S]{0,80}?"
+    r"\b(command|script|shell|terminal|bash|sh|zsh|cmd|powershell|pwsh|curl|wget|npm|npx|node|python|yarn|pnpm|bun"
+    r"|deno|pip)\b", re.I)
+SHELL_FENCE_RE = re.compile(r"`{3}[ \t]*(bash|sh|zsh|shell|console|powershell|pwsh|ps1|cmd|bat)\b", re.I)
 # Just the value: tasks.json allows comments, so "runOn": /* x */ "folderOpen" must still match
 FOLDER_OPEN_RE = re.compile(r'"folderOpen"', re.I)
 # Settings keys that make Claude Code or Gemini CLI run a command on their own, not just "hooks"
@@ -251,10 +254,12 @@ def decode_escapes(text: str) -> str:
 
 
 def line_of(text: str, m: re.Match) -> str:
-    """The line containing a match, trimmed, for quoting in a finding."""
-    start = text.rfind("\n", 0, m.start()) + 1
-    end = text.find("\n", m.end())
-    return text[start:end if end >= 0 else len(text)].strip()[:150]
+    """The lines of a match plus the next two (where a code block's command usually is), trimmed, for quoting."""
+    start, end = text.rfind("\n", 0, m.start()) + 1, m.end()
+    for _ in range(3):
+        nl = text.find("\n", end)
+        end = len(text) if nl < 0 else nl + 1
+    return text[start:end].strip()[:150]
 
 
 def text_pattern_hits(text: str) -> list[str]:
@@ -375,7 +380,8 @@ def ai_agent_config(e):
         yield Finding(HIGH, f"{tool} with {m[1]!r}: runs shell commands automatically during an AI session")
     if cursor or instructions:
         downloads = text_pattern_hits(text)
-        m = AGENT_RUN_RE.search(text) or (downloads and TEXT_PATTERNS[downloads[0]].search(text))
+        m = (AGENT_RUN_RE.search(text) or SHELL_FENCE_RE.search(text)
+             or (downloads and TEXT_PATTERNS[downloads[0]].search(text)))
         if m:
             # Cursor rules are HIGH for any hit (spec). Other instruction files often say "run npm test", so a plain
             # run instruction is MEDIUM there and only download-and-run style content is HIGH. Quote the line either way.

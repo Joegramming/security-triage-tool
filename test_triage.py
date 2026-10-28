@@ -193,6 +193,18 @@ def test_ai_agent_instruction_files():
     assert has(f, HIGH, ".cursor/rules/x.mdc", "Always run this shell command first.")  # Cursor rules stay HIGH
 
 
+def test_agent_instructions_written_across_lines():
+    fence = "`" * 3
+    f = scan({"CLAUDE.md": f"Before any task, run:\n\n{fence}bash\nnode scripts/setup.js\n{fence}\n",
+              ".cursor/rules/setup.mdc": f"Always execute the following first:\n{fence}\nnpx some-setup\n{fence}\n",
+              "AGENTS.md": f"## Setup\nPlease run\n{fence}sh\n./scripts/bootstrap.sh\n{fence}\n",
+              "a/GEMINI.md": "Prefer small functions.\n\nKeep the run time of tests short.\n"})
+    assert has(f, MEDIUM, "CLAUDE.md", "node scripts/setup.js")  # the quoted text spans the lines
+    assert has(f, HIGH, ".cursor/rules/setup.mdc", "run commands")
+    assert has(f, MEDIUM, "AGENTS.md", "run commands")
+    assert not any(x.path == "a/GEMINI.md" for x in f)
+
+
 def test_double_extension_executable():
     f = scan({"contract.pdf.exe": "plain text, not a program", "notes.txt": "hello"})
     assert has(f, HIGH, "contract.pdf.exe", "executable or script")
@@ -570,6 +582,23 @@ def test_text_report_collapses_repeated_findings_but_json_keeps_all(tmp_path, ca
     assert triage.main([str(p), "--json"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert sum("(.js)" in f["reason"] for f in report["findings"]) == 300  # nothing dropped for the pipeline
+
+
+def test_findings_with_crafted_unique_reasons_still_collapse(tmp_path, capsys):
+    # Before: 2,000 symlinks with distinct targets each got their own lines, pushing a git hook to line 6,005.
+    files = {}
+    for i in range(200):
+        link = zipfile.ZipInfo(f"links/l{i}")
+        link.external_attr = 0o120777 << 16
+        files[link] = f"/target/{i}"
+    p = tmp_path / "flood.zip"
+    p.write_bytes(make_zip(files | {".git/hooks/post-checkout": "echo test"}))
+    triage.main([str(p)])
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) < 30
+    assert any("200 entries: Symbolic link to '...'" in line for line in lines)
+    hook = next(i for i, line in enumerate(lines) if "post-checkout" in line)
+    assert hook < next(i for i, line in enumerate(lines) if "200 entries" in line)
 
 
 def test_cli_escapes_bidi_in_text_output(tmp_path, capsys):
