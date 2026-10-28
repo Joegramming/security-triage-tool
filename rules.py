@@ -31,7 +31,8 @@ ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".c
 # Extensions attackers put before the real one: invoice.pdf.exe
 DECOY_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".csv",
               ".jpg", ".jpeg", ".png", ".gif", ".mp3", ".mp4", ".mov", ".zip", ".html", ".htm"}
-BIDI_CHARS = set("‪‫‬‭‮⁦⁧⁨⁩‎‏")
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+BIDI_CHARS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f")
 NPM_LIFECYCLE_SCRIPTS = {"preinstall", "install", "postinstall", "prepare"}
 
 # (section, key) -> why it's dangerous. key "*" matches any key in that section.
@@ -63,7 +64,11 @@ DANGEROUS_GIT_CONFIG = {
 # Input is hostile, so patterns must stay linear. Gaps are bounded ({0,200}): an unbounded [^\n]* rescans
 # the rest of the line from every match start, so a few KB of compressed "curl curl ..." could stall the scan for hours.
 TEXT_PATTERNS = {
-    "curl/wget piped to a shell": re.compile(r"\b(curl|wget)\b[^\n|]{0,200}\|\s*(sudo\s+)?(ba|z|da|k)?sh\b", re.I),
+    "curl/wget piped to a shell": re.compile(  # also | sudo -E bash, | /bin/bash
+        r"\b(curl|wget)\b[^\n|]{0,200}\|\s*(sudo(\s+-\S+)*\s+)?([^\s|]{0,100}/)?(ba|z|da|k)?sh\b", re.I),
+    # bash -c "$(curl ...)", bash <(curl ...); separate pattern + lookahead: 2x faster than one combined regex
+    "shell running curl/wget output": re.compile(
+        r"(?=[bzdks])\b(?:ba|z|da|k)?sh\b[^\n]{0,20}(?:\$\(|<\()\s*(?:curl|wget)\b", re.I),
     "PowerShell encoded command": re.compile(
         r"(^|\s)-(enc|encodedcommand)\b|\b(powershell|pwsh)(\.exe)?\b[^\n]{0,200}\s[-/]e[a-z]*\s+['\"]?[a-z0-9+/=]{16,}", re.I),
     "IEX / Invoke-Expression": re.compile(r"\b(iex|invoke-expression)\b", re.I),
@@ -73,6 +78,20 @@ TEXT_PATTERNS = {
     "node -e": re.compile(r"\bnode(\.exe)?\s+(-e|--eval|-p|--print)\b", re.I),
     "python -c": re.compile(r"\b(python[0-9.]*|py)(\.exe)?\s+-c\b", re.I),
 }
+# Speed prefilter: a pattern only runs if one of its words is in the (lowercased) file.
+# Patterns without an entry here always run. A wrong word here silently disables a pattern, so test each one.
+TEXT_PATTERN_KEYWORDS = {
+    "curl/wget piped to a shell": ("curl", "wget"),
+    "shell running curl/wget output": ("curl", "wget"),
+    "PowerShell encoded command": ("-enc", "powershell", "pwsh"),
+    "IEX / Invoke-Expression": ("iex", "invoke-expression"),
+    "Invoke-WebRequest / DownloadString": ("invoke-webrequest", "downloadstring"),
+    "eval(atob(...))": ("atob",),
+    "node -e": ("node",),
+    "python -c": ("py",),
+}
+# re.I matches \u0130 and \u0131 as i and \u017f as s, but str.lower() doesn't: map them so the prefilter never skips a match
+KEYWORD_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s"})
 AGENT_RUN_RE = re.compile(
     r"\b(run|execute|exec|invoke|launch)\b[^\n]{0,60}"
     r"\b(command|script|shell|terminal|bash|cmd|powershell|pwsh|curl|wget|npm|npx|node|python)\b", re.I)
@@ -130,16 +149,19 @@ class Entry:
     def ext(self) -> str:
         return posixpath.splitext(self.name)[1]
 
+    @property
+    def is_binary(self) -> bool:
+        return bool(self.data) and self.data[:2] not in UTF16_BOMS and b"\0" in self.data[:8192]
+
     @cached_property
     def text(self) -> str | None:
-        """Decoded content for text files, None for binaries and unread files."""
+        """Decoded content, None for empty or unread files. Deliberately not None for "binary" files:
+        one NUL byte in a comment must not hide a tasks.json or git config from its rule."""
         d = self.data
         if not d:
             return None
-        if d[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        if d[:2] in UTF16_BOMS:
             return d.decode("utf-16", "replace")
-        if b"\0" in d[:8192]:
-            return None
         return d.decode("utf-8-sig", "replace")
 
     @cached_property
@@ -153,7 +175,7 @@ class Entry:
 
 def annotate_git_dirs(entries: list[Entry]) -> None:
     """Set git_depth on entries inside anything git treats as a repository: a .git folder,
-    or a bare-repo layout (HEAD + config + objects/ or refs/), which is how a .git file's gitdir: target looks.
+    or a bare-repo layout (HEAD + objects/ or refs/), which is how a .git file's gitdir: target looks.
     Folders get integer ids so hostile, very deep paths cost linear time instead of one string per prefix."""
     ids = {}               # (parent id, part) -> folder id; 0 is the archive root
     names = {0: ""}        # folder id -> its own name
@@ -170,8 +192,9 @@ def annotate_git_dirs(entries: list[Entry]) -> None:
         if not e.is_dir and e.parts:
             children[fid].add(e.parts[-1])
         chains.append(chain)
+    # git itself needs HEAD + objects/ + refs/ and treats config as optional, so don't require config
     git = {fid for fid, c in children.items()
-           if names[fid] == ".git" or {"head", "config"} <= c and ("objects/" in c or "refs/" in c)}
+           if names[fid] == ".git" or "head" in c and ("objects/" in c or "refs/" in c)}
     for e, chain in zip(entries, chains):
         e.git_depth = max((depth for depth, fid in enumerate(chain) if fid in git), default=None)
 
@@ -189,6 +212,14 @@ def git_config_items(text: str):
 def unescape_json(text: str) -> str:
     """Undo \\uXXXX escapes so "run\\u004fn" can't dodge the regexes."""
     return JSON_ESCAPE_RE.sub(lambda m: chr(int(m[1], 16)), text)
+
+
+def text_pattern_hits(text: str) -> list[str]:
+    """Names of the TEXT_PATTERNS found in text; the keyword prefilter skips most regex passes on normal files."""
+    folded = (text if text.isascii() else text.translate(KEYWORD_FOLD)).lower()
+    return [name for name, rx in TEXT_PATTERNS.items()
+            if (name not in TEXT_PATTERN_KEYWORDS or any(k in folded for k in TEXT_PATTERN_KEYWORDS[name]))
+            and rx.search(text)]
 
 
 # --- Rules -------------------------------------------------------------------
@@ -227,7 +258,7 @@ def git_repository(e):
     if (depth := e.git_depth) is not None:
         what = (".git directory: git commands run in this folder (including VS Code's automatic ones) obey its hooks and config"
                 if depth and e.parts[depth - 1] == ".git" else
-                "Bare git repository layout (HEAD, config, objects/ or refs/): git treats this folder as a repository")
+                "Bare git repository layout (HEAD with objects/ or refs/): git treats this folder as a repository")
         yield Finding(HIGH, what, path=e.dir_path(depth))
     if e.name == ".git" and not e.is_dir:
         yield Finding(HIGH, ".git file (gitdir: pointer): can redirect git to a repository hidden elsewhere")
@@ -271,7 +302,7 @@ def ai_agent_config(e):
         yield Finding(HIGH, "Claude Code settings with hooks: runs shell commands automatically during an AI session")
     if gemini and HOOKS_RE.search(text):
         yield Finding(HIGH, "Gemini CLI config with hooks: runs shell commands automatically during an AI session")
-    if cursor and (AGENT_RUN_RE.search(text) or any(rx.search(text) for rx in TEXT_PATTERNS.values())):
+    if cursor and (AGENT_RUN_RE.search(text) or text_pattern_hits(text)):
         yield Finding(HIGH, "Cursor rule file that tells the AI agent to run commands")
     if mcp and '"command"' in text:
         yield Finding(MEDIUM, "MCP server config: launches local commands when an AI tool opens this folder")
@@ -337,7 +368,6 @@ def nested_archive(e):
 
 @rule
 def suspicious_text(e):
-    if e.text:
-        hits = [name for name, rx in TEXT_PATTERNS.items() if rx.search(e.text)]
-        if hits:
+    if not e.is_binary and e.text:  # the one rule that scans every file, so skip images, binaries, etc.
+        if hits := text_pattern_hits(e.text):
             yield Finding(MEDIUM, "Suspicious content: " + ", ".join(hits))

@@ -24,17 +24,18 @@ from rules import HIGH, MEDIUM, Entry, Finding
 
 MAX_TOTAL_BYTES = 500 * 2**20  # everything decompressed in one run, nested archives included
 MAX_FILE_BYTES = 50 * 2**20    # content read per entry
-MAX_ENTRIES = 20_000           # per archive
+MAX_ENTRIES = 20_000           # per run, nested archives included (per archive would multiply with nesting)
 MAX_DEPTH = 3                  # nested zips
 DISCLAIMER = "No findings does not mean safe. Never open repos received as files; fresh-clone from a GitHub link instead."
 
 
 class Scan:
-    """Findings plus the decompression budget shared by one run."""
+    """Findings plus the decompression and entry budgets shared by one run."""
 
     def __init__(self):
         self.findings: list[Finding] = []
         self._seen = set()
+        self.entries = 0
         self.bytes_read = 0
         self.capped = False
         # always present so --json keeps one shape; None when the archive couldn't be opened
@@ -55,7 +56,9 @@ def read_entry(zf, info, scan, where):
         with zf.open(info) as f:
             data = f.read(MAX_FILE_BYTES + 1)
     except Exception as exc:  # bad CRC, corrupt stream, unsupported compression, overlapping entries: flag, don't crash
-        scan.add(Finding(MEDIUM, f"Could not read entry ({type(exc).__name__}: {exc})", where))
+        # HIGH like encrypted entries: contents are unknown, and a deliberately broken CRC must not
+        # downgrade e.g. a folderOpen tasks.json that some extractors still write to disk
+        scan.add(Finding(HIGH, f"Could not read entry ({type(exc).__name__}: {exc}): contents unknown", where))
         return None
     scan.bytes_read += len(data)
     if scan.bytes_read > MAX_TOTAL_BYTES:
@@ -71,6 +74,9 @@ def read_entry(zf, info, scan, where):
 
 def scan_zip(source, scan, label, prefix="", depth=0):
     """Run every rule on every entry of the zip at `source` (path or file object), recursing into nested zips."""
+    if scan.entries >= MAX_ENTRIES:  # opening it would still parse its whole file list
+        scan.add(Finding(HIGH, f"Over {MAX_ENTRIES:,} entries in total (nested zips included): not scanned, contents unknown", label))
+        return
     try:
         zf = zipfile.ZipFile(source)
     except Exception as exc:  # BadZipFile, or whatever a malformed header triggers: flag, don't crash
@@ -85,9 +91,12 @@ def scan_zip(source, scan, label, prefix="", depth=0):
                 "compressed_bytes": sum(i.compress_size for i in infos),
                 "uncompressed_bytes_declared": sum(i.file_size for i in infos),
             }
-        if len(infos) > MAX_ENTRIES:
-            scan.add(Finding(HIGH, f"{len(infos)} entries; only the first {MAX_ENTRIES} were checked (possible zip bomb)", label))
-            infos = infos[:MAX_ENTRIES]
+        budget = max(MAX_ENTRIES - scan.entries, 0)
+        if len(infos) > budget:
+            scan.add(Finding(HIGH, f"Over {MAX_ENTRIES:,} entries in total (nested zips included): {len(infos) - budget:,} "
+                                   "entries here were not checked (possible zip bomb)", label))
+            infos = infos[:budget]
+        scan.entries += len(infos)
         stubs = [Entry(i.filename.replace("\\", "/")) for i in infos]
         rules.annotate_git_dirs(stubs)
         encrypted = 0
@@ -168,6 +177,7 @@ def defender_scan(path, scan):
 
 def triage(path: Path, virustotal=False, defender=False) -> dict:
     scan = Scan()
+    size = path.stat().st_size  # read before Defender runs: it may quarantine (delete) the file
     with path.open("rb") as f:
         sha256 = hashlib.file_digest(f, "sha256").hexdigest()
     scan_zip(path, scan, path.name)
@@ -178,7 +188,7 @@ def triage(path: Path, virustotal=False, defender=False) -> dict:
         notes.append(defender_scan(path, scan))
     order = {HIGH: 0, MEDIUM: 1}
     findings = sorted(scan.findings, key=lambda f: order[f.severity])  # stable: archive order within a severity
-    return {"file": str(path), "sha256": sha256, "size_bytes": path.stat().st_size, **scan.stats,
+    return {"file": str(path), "sha256": sha256, "size_bytes": size, **scan.stats,
             "findings": [asdict(f) for f in findings], "notes": notes, "disclaimer": DISCLAIMER}
 
 
