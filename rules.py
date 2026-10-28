@@ -33,6 +33,11 @@ NETWORK_PATH_RE = re.compile(r"\\\\[^\\\s]+\\|(?<![:\w])//[^/\s]+/|file:", re.I)
 MACRO_OFFICE_EXTS = {".docm", ".dotm", ".xlsm", ".xltm", ".xlam", ".pptm", ".potm", ".ppsm", ".ppam"}
 LEGACY_OFFICE_EXTS = {".doc", ".xls", ".ppt"}
 VBA_MARKER = "_VBA_PROJECT".encode("utf-16-le")  # OLE stream name present when a legacy Office file has macros
+# File types that are big for normal reasons; over the size cap they stay MEDIUM. Anything else over the cap
+# is HIGH, since padding a tasks.json or git config past the cap would otherwise hide it from its rule.
+BIG_MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mp3", ".wav", ".flac", ".png", ".jpg", ".jpeg", ".gif",
+                  ".webp", ".tif", ".tiff", ".psd", ".ai", ".glb", ".fbx", ".obj", ".blend", ".hdr", ".exr", ".ktx2",
+                  ".pdf"}
 ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".cab"}
 # Extensions attackers put before the real one: invoice.pdf.exe
 DECOY_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".csv",
@@ -109,7 +114,10 @@ AGENT_RUN_RE = re.compile(
     r"\b(command|script|shell|terminal|bash|cmd|powershell|pwsh|curl|wget|npm|npx|node|python)\b", re.I)
 # Just the value: tasks.json allows comments, so "runOn": /* x */ "folderOpen" must still match
 FOLDER_OPEN_RE = re.compile(r'"folderOpen"', re.I)
-HOOKS_RE = re.compile(r"""["']?hooks["']?\s*[:=]""", re.I)
+# Settings keys that make Claude Code or Gemini CLI run a command on their own, not just "hooks"
+AGENT_COMMAND_KEYS_RE = re.compile(
+    r"""["']?(hooks|statusLine|apiKeyHelper|awsAuthRefresh|awsCredentialExport|otelHeadersHelper"""
+    r"""|toolDiscoveryCommand|toolCallCommand)["']?\s*[:=]""", re.I)
 JSON_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 SHORT_NAME_RE = re.compile(r"[^.~]{1,6}~\d{1,6}(\.[^.]{0,3})?")  # 8.3 short name: up to 6 chars, ~N, optional 3-char ext
 GIT_SECTION_RE = re.compile(r'\s*\[\s*([^\]\s"]+)\s*(?:"(?:[^"\\]|\\.)*")?\s*\](.*)')
@@ -139,6 +147,7 @@ class Entry:
     data: bytes | None = None
     git_depth: int | None = None  # number of leading path parts forming the enclosing git dir, set by annotate_git_dirs()
     is_symlink: bool = False      # Unix symlink entry; its data is the link target
+    too_big: bool = False         # over the per-file cap, so data is None and content rules can't run
 
     @cached_property
     def raw_parts(self) -> list[str]:
@@ -263,6 +272,15 @@ def path_traversal(e):
 
 
 @rule
+def oversized_file(e):
+    if e.too_big and e.ext in BIG_MEDIA_EXTS:
+        yield Finding(MEDIUM, f"Larger than the per-file size cap ({e.ext}): content not inspected")
+    elif e.too_big:
+        yield Finding(HIGH, "Larger than the per-file size cap: contents unknown (padding can hide a config file "
+                            "like tasks.json or .git/config from its rule)")
+
+
+@rule
 def windows_path_tricks(e):
     short = next((raw for raw, part in zip(e.raw_parts, e.parts) if SHORT_NAME_RE.fullmatch(part)), None)
     if short:
@@ -331,13 +349,12 @@ def ai_agent_config(e):
     if not (claude or gemini or cursor or mcp) or not e.text:
         return  # check the path first: unescaping every text file costs seconds on escape-packed input
     text = unescape_json(e.text)
-    if claude and HOOKS_RE.search(text):
-        yield Finding(HIGH, "Claude Code settings with hooks: runs shell commands automatically during an AI session")
-    if gemini and HOOKS_RE.search(text):
-        yield Finding(HIGH, "Gemini CLI config with hooks: runs shell commands automatically during an AI session")
+    if (claude or gemini) and (m := AGENT_COMMAND_KEYS_RE.search(text)):
+        tool = "Claude Code settings" if claude else "Gemini CLI config"
+        yield Finding(HIGH, f"{tool} with {m[1]!r}: runs shell commands automatically during an AI session")
     if cursor and (AGENT_RUN_RE.search(text) or text_pattern_hits(text)):
         yield Finding(HIGH, "Cursor rule file that tells the AI agent to run commands")
-    if mcp and '"command"' in text:
+    if (mcp or gemini and '"mcpServers"' in text) and '"command"' in text:
         yield Finding(MEDIUM, "MCP server config: launches local commands when an AI tool opens this folder")
 
 
@@ -411,11 +428,12 @@ def hook_manager_dirs(e):
 def nested_archive(e):
     if e.is_dir or e.ext not in ARCHIVE_EXTS:
         return
-    if e.ext == ".zip" and e.data is None:  # padding a nested zip past the size cap must not hide what's inside
+    if e.ext != ".zip":  # only zips are opened; anything else could hide a whole repo
+        yield Finding(HIGH, f"Nested archive ({e.ext}): contents not inspected, could hide anything")
+    elif e.data is None:  # padding a nested zip past the size cap must not hide what's inside
         yield Finding(HIGH, "Nested zip that could not be inspected (too big, encrypted or unreadable): contents unknown")
     else:
-        note = "anything found inside is listed as this path + !/" if e.ext == ".zip" else "contents not inspected"
-        yield Finding(MEDIUM, f"Nested archive ({e.ext}); {note}")
+        yield Finding(MEDIUM, "Nested archive (.zip); anything found inside is listed as this path + !/")
 
 
 @rule

@@ -162,6 +162,19 @@ def test_detection_branch_variants():
     assert has(f, HIGH, ".git/config", "includeif.path")
 
 
+def test_agent_settings_that_run_commands_without_hooks():
+    f = scan({".claude/settings.json": '{"statusLine": {"type": "command", "command": "x"}}',
+              "a/.claude/settings.json": '{"apiKeyHelper": "x"}',
+              ".gemini/settings.json": '{"toolDiscoveryCommand": "x"}',
+              "b/.gemini/settings.json": '{"mcpServers": {"x": {"command": "x"}}}',
+              "c/.claude/settings.json": '{"permissions": {"allow": []}}'})
+    assert has(f, HIGH, ".claude/settings.json", "statusLine")
+    assert has(f, HIGH, "a/.claude/settings.json", "apiKeyHelper")
+    assert has(f, HIGH, ".gemini/settings.json", "toolDiscoveryCommand")
+    assert has(f, MEDIUM, "b/.gemini/settings.json", "MCP")
+    assert not any(x.path == "c/.claude/settings.json" for x in f)
+
+
 def test_double_extension_executable():
     f = scan({"contract.pdf.exe": "plain text, not a program", "notes.txt": "hello"})
     assert has(f, HIGH, "contract.pdf.exe", "executable or script")
@@ -327,6 +340,14 @@ def test_nested_zips_scanned_to_depth_3():
     assert not any("pre-push" in x.path for x in f)
 
 
+def test_nested_non_zip_archives_are_high():
+    f = scan({"project.tar.gz": b"\x1f\x8b\x08\x00 not inspected", "b.7z": b"7z\xbc\xaf", "c.rar": b"Rar!",
+              "d.zip": make_zip({"a.txt": "x"})})
+    for p in ("project.tar.gz", "b.7z", "c.rar"):
+        assert has(f, HIGH, p, "contents not inspected"), p
+    assert has(f, MEDIUM, "d.zip", "nested archive")  # zips are opened, so listing them stays MEDIUM
+
+
 def test_disguised_nested_zips_are_scanned():
     inner = make_zip({".git/hooks/post-checkout": "echo test"})
     f = scan({"inner.zip": b"X" + inner,                      # junk prefix: zip tools still open it
@@ -386,9 +407,14 @@ def test_nested_zip_over_size_cap_is_high(monkeypatch):
 
 
 def test_per_file_cap(monkeypatch):
+    # The cap stands in for 50 MiB; that much padding compresses to ~50 KB, so it costs an attacker nothing.
     monkeypatch.setattr(triage, "MAX_FILE_BYTES", 100)
-    f = scan({"big.txt": "a" * 1000})
-    assert has(f, MEDIUM, "big.txt", "per-file cap")
+    f = scan({"big.txt": "a" * 1000, "video.mp4": b"\0" * 1000,
+              ".vscode/tasks.json": " " * 1000 + '{"runOptions":{"runOn":"folderOpen"}}'})
+    assert has(f, HIGH, "big.txt", "per-file size cap")
+    assert has(f, HIGH, ".vscode/tasks.json", "contents unknown")  # padded config: never just MEDIUM
+    assert has(f, MEDIUM, "video.mp4", "per-file size cap")  # big for normal reasons
+    assert not any(x.severity == HIGH and x.path == "video.mp4" for x in f)
 
 
 def test_total_cap_stops_reading_but_names_still_checked(monkeypatch):

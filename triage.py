@@ -51,9 +51,10 @@ class Scan:
 
 
 def read_entry(zf, info, scan, where):
-    """Read one entry into memory, within the caps. Returns None if it can't or shouldn't be read."""
+    """Read one entry into memory, within the caps. Returns (data, too_big); data is None if it can't or
+    shouldn't be read. Over-cap files are reported by the oversized_file rule, which knows the file type."""
     if scan.capped:
-        return None
+        return None, False
     try:
         with zf.open(info) as f:
             data = f.read(MAX_FILE_BYTES + 1)
@@ -61,17 +62,16 @@ def read_entry(zf, info, scan, where):
         # HIGH like encrypted entries: contents are unknown, and a deliberately broken CRC must not
         # downgrade e.g. a folderOpen tasks.json that some extractors still write to disk
         scan.add(Finding(HIGH, f"Could not read entry ({type(exc).__name__}: {exc}): contents unknown", where))
-        return None
+        return None, False
     scan.bytes_read += len(data)
     if scan.bytes_read > MAX_TOTAL_BYTES:
         scan.capped = True
         scan.add(Finding(HIGH, f"Total uncompressed size passed the {MAX_TOTAL_BYTES // 2**20} MiB cap (possible zip bomb): "
                                "stopped reading contents, remaining entries checked by name only", where))
-        return None
+        return None, False
     if len(data) > MAX_FILE_BYTES:
-        scan.add(Finding(MEDIUM, f"Larger than the {MAX_FILE_BYTES // 2**20} MiB per-file cap: content not inspected", where))
-        return None
-    return data
+        return None, True
+    return data, False
 
 
 def unicode_path_name(info):
@@ -126,10 +126,11 @@ def scan_zip(source, scan, label, prefix="", depth=0):
         rules.annotate_git_dirs(stubs)
         encrypted = sum(info.flag_bits & 0x1 for info in infos)
         for (info, _), stub in zip(named, stubs):
-            data = None
+            data, too_big = None, False
             if not info.flag_bits & 0x1 and not stub.is_dir:
-                data = read_entry(zf, info, scan, prefix + stub.path)
-            entry = Entry(stub.path, data, stub.git_depth, stat.S_ISLNK(info.external_attr >> 16))
+                data, too_big = read_entry(zf, info, scan, prefix + stub.path)
+            entry = Entry(stub.path, data, stub.git_depth, is_symlink=stat.S_ISLNK(info.external_attr >> 16),
+                          too_big=too_big)
             for f in rules.run_rules(entry):
                 if not f.path:
                     f.path, f.sha256 = entry.path, entry.sha256
