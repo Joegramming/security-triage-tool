@@ -6,7 +6,7 @@ Built after a phishing zip containing a full Git repo whose `.git` hooks/config 
 
 ## Usage
 
-Python 3.11+, standard library only.
+Python 3.11+ (tested on 3.11, 3.12 and 3.14), standard library only.
 
 ```
 python triage.py <file> [--json] [--virustotal] [--defender]
@@ -24,7 +24,7 @@ Tests: `pip install pytest`, then `python -m pytest`.
 
 ## What it flags
 
-**HIGH**: `.git` directories (also `.GIT.`, `GIT~1`, bare-repo layouts and `.git` gitdir-pointer files), non-`.sample` git hooks, dangerous `.git/config` keys (`core.fsmonitor`/`hooksPath`/`sshCommand`/`pager`/`editor`, `!` aliases, `url.*.insteadOf`, `credential.helper`, filters, textconv, `include.path`, …), `.vscode/tasks.json` with `runOn: folderOpen`, Claude/Gemini settings with hooks, Cursor rules that tell the agent to run commands, executables/scripts by extension, double extensions, bidi/RTL-override characters in names, macro Office files (`.docm`/`.xlsm`/`.pptm`/…, legacy `.doc`/`.xls`/`.ppt` with VBA, `vbaProject.bin` inside any OOXML file), path traversal / absolute paths, password-protected or unreadable entries (contents unknown), corrupted archives, zip-bomb caps exceeded, nested zips that couldn't be inspected (over the size cap, encrypted, unreadable, or more than 3 levels deep).
+**HIGH**: `.git` directories (also `.GIT.`, `GIT~1`, bare-repo layouts and `.git` gitdir-pointer files), non-`.sample` git hooks, dangerous `.git/config` keys (`core.fsmonitor`/`hooksPath`/`sshCommand`/`pager`/`editor`, `!` aliases, `url.*.insteadOf`, `credential.helper`, filters, textconv, `include.path`, …), `.vscode/tasks.json` with `runOn: folderOpen`, Claude/Gemini settings with hooks, Cursor rules that tell the agent to run commands, executables/scripts by extension (incl. `.xll`, ClickOnce, `.settingcontent-ms`), Windows shell files that leak your login hash when Explorer shows the folder (`.library-ms`, `.searchConnector-ms`, `.scf`, `.url`, `desktop.ini` with a network path), symlink entries, double extensions, bidi/RTL-override characters in names, macro Office files (`.docm`/`.xlsm`/`.pptm`/…, legacy `.doc`/`.xls`/`.ppt` with VBA, `vbaProject.bin` inside any OOXML file), path traversal / absolute paths, password-protected or unreadable entries (contents unknown), entries with more than one name (Unicode-path field or a NUL byte; every name is checked), two zips joined into one file (both are scanned), corrupted archives, zip-bomb caps exceeded, nested zips that couldn't be inspected (over the size cap, encrypted, unreadable, or more than 3 levels deep).
 
 **MEDIUM**: npm `preinstall`/`install`/`postinstall`/`prepare` scripts, `.husky/` and `.githooks/`, MCP server configs, nested archives (nested zips are scanned to depth 3 and their findings listed as `outer.zip!/inner/path`; other formats only listed), suspicious text (curl/wget piped to a shell or run via `bash -c "$(curl …)"` / `bash <(curl …)`, `powershell -enc`, `IEX`, `Invoke-WebRequest`, `eval(atob(…))`, base64 blobs of 300+ chars, `node -e`, `python -c`), files over the per-file cap, a requested `--virustotal`/`--defender` check that couldn't run (so a missing API key never looks like a clean result).
 

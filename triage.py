@@ -11,6 +11,8 @@ import hashlib
 import io
 import json
 import os
+import stat
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -72,6 +74,18 @@ def read_entry(zf, info, scan, where):
     return data
 
 
+def unicode_path_name(info):
+    """Name from an Info-ZIP Unicode Path extra field (0x7075). Parsed here because Python 3.11's zipfile
+    ignores it and 3.12+ ignores it when its checksum doesn't match, while other tools (e.g. 7-Zip) may use it."""
+    extra = info.extra
+    while len(extra) >= 4:
+        kind, size = struct.unpack("<HH", extra[:4])
+        if kind == 0x7075 and size > 5 and extra[4] == 1:  # version 1, then CRC32 of the plain name, then UTF-8
+            return extra[9:4 + size].decode("utf-8", "replace")
+        extra = extra[4 + size:]
+    return None
+
+
 def scan_zip(source, scan, label, prefix="", depth=0):
     """Run every rule on every entry of the zip at `source` (path or file object), recursing into nested zips."""
     if scan.entries >= MAX_ENTRIES:  # opening it would still parse its whole file list
@@ -97,16 +111,25 @@ def scan_zip(source, scan, label, prefix="", depth=0):
                                    "entries here were not checked (possible zip bomb)", label))
             infos = infos[:budget]
         scan.entries += len(infos)
-        stubs = [Entry(i.filename.replace("\\", "/")) for i in infos]
+        # An entry can carry several names: the plain header name, a Unicode-path extra field, or a name zipfile
+        # cut at a NUL byte. Tools disagree on which they use, so every rule checks all of them.
+        named = []
+        for info in infos:
+            names = list(dict.fromkeys(n.replace("\\", "/") for n in
+                                       (info.filename, info.orig_filename, unicode_path_name(info)) if n))
+            named += [(info, n) for n in names]
+            if len(names) > 1:
+                scan.add(Finding(HIGH, f"Entry has more than one name ({', '.join(map(repr, names))}): extraction "
+                                       "tools disagree on which one they write, so all of them are checked",
+                                 prefix + names[-1]))
+        stubs = [Entry(name) for _, name in named]
         rules.annotate_git_dirs(stubs)
-        encrypted = 0
-        for info, stub in zip(infos, stubs):
+        encrypted = sum(info.flag_bits & 0x1 for info in infos)
+        for (info, _), stub in zip(named, stubs):
             data = None
-            if info.flag_bits & 0x1:
-                encrypted += 1
-            elif not stub.is_dir:
+            if not info.flag_bits & 0x1 and not stub.is_dir:
                 data = read_entry(zf, info, scan, prefix + stub.path)
-            entry = Entry(stub.path, data, stub.git_depth)
+            entry = Entry(stub.path, data, stub.git_depth, stat.S_ISLNK(info.external_attr >> 16))
             for f in rules.run_rules(entry):
                 if not f.path:
                     f.path, f.sha256 = entry.path, entry.sha256
@@ -123,6 +146,22 @@ def scan_zip(source, scan, label, prefix="", depth=0):
         if encrypted:
             scan.add(Finding(HIGH, f"Password-protected archive: {encrypted} encrypted entr{'y' if encrypted == 1 else 'ies'} "
                                    "could not be inspected (a common way to slip malware past scanners)", label))
+        scan_joined_archive(zf, infos, scan, label, prefix, depth)
+
+
+def scan_joined_archive(zf, infos, scan, label, prefix, depth):
+    """zipfile reads the last archive in a file; some tools show the first. Scan whatever sits in front."""
+    start = min((i.header_offset for i in infos), default=0)
+    if start == 0 or scan.capped:
+        return
+    zf.fp.seek(0)
+    head = zf.fp.read(min(start, MAX_FILE_BYTES))
+    scan.bytes_read += len(head)
+    if zipfile.is_zipfile(io.BytesIO(head)):
+        scan.add(Finding(HIGH, "Two zip archives joined into one file: tools disagree on which one they show, "
+                               "so the first one is scanned too (its findings are listed under (first archive)!/)", label))
+        if depth < MAX_DEPTH:
+            scan_zip(io.BytesIO(head), scan, label + " (first archive)", prefix + "(first archive)!/", depth + 1)
 
 
 def check_did_not_run(scan, label, note):

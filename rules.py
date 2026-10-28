@@ -23,7 +23,13 @@ EXECUTABLE_EXTS = {
     ".ps1", ".vbs", ".js", ".jse", ".wsf", ".hta", ".jar",
     # also run or mount on double-click in Windows
     ".com", ".pif", ".cpl", ".vbe", ".psm1", ".reg", ".chm", ".vhdx", ".msix", ".appx",
+    # Excel add-in (code runs on open), ClickOnce apps, settings shortcuts that run commands, patches, script hosts
+    ".xll", ".appref-ms", ".application", ".settingcontent-ms", ".msp", ".wsh",
 }
+# Explorer reads these just to show the folder, and they can point it at a remote server, which then receives
+# your Windows login hash; no click needed (exploited from zips in 2025, CVE-2025-24054 via .library-ms)
+WINDOWS_SHELL_EXTS = {".library-ms", ".searchconnector-ms", ".scf", ".url", ".website"}
+NETWORK_PATH_RE = re.compile(r"\\\\[^\\\s]+\\|(?<![:\w])//[^/\s]+/|file:", re.I)  # \\server\, //server/, file:
 MACRO_OFFICE_EXTS = {".docm", ".dotm", ".xlsm", ".xltm", ".xlam", ".pptm", ".potm", ".ppsm", ".ppam"}
 LEGACY_OFFICE_EXTS = {".doc", ".xls", ".ppt"}
 VBA_MARKER = "_VBA_PROJECT".encode("utf-16-le")  # OLE stream name present when a legacy Office file has macros
@@ -124,6 +130,7 @@ class Entry:
     path: str                   # path inside the archive, '/'-separated, original spelling
     data: bytes | None = None
     git_depth: int | None = None  # number of leading path parts forming the enclosing git dir, set by annotate_git_dirs()
+    is_symlink: bool = False      # Unix symlink entry; its data is the link target
 
     @cached_property
     def raw_parts(self) -> list[str]:
@@ -248,6 +255,13 @@ def path_traversal(e):
 
 
 @rule
+def symlink(e):
+    if e.is_symlink:
+        yield Finding(HIGH, f"Symbolic link to {(e.text or '?')[:200]!r}: unzip on WSL, macOS or Linux creates it, "
+                            "and later entries can then be written through it to anywhere on disk")
+
+
+@rule
 def bidi_characters(e):
     if any(c in BIDI_CHARS for c in e.path):
         yield Finding(HIGH, "Right-to-left override or other bidi control character in the name (hides the real extension)")
@@ -312,6 +326,15 @@ def ai_agent_config(e):
 def executable(e):
     if not e.is_dir and e.ext in EXECUTABLE_EXTS:
         yield Finding(HIGH, f"Executable or script file type ({e.ext})")
+
+
+@rule
+def windows_shell_files(e):
+    leak = "Explorer can contact a remote server just by showing the folder, sending it your Windows login hash"
+    if not e.is_dir and e.ext in WINDOWS_SHELL_EXTS:
+        yield Finding(HIGH, f"Windows shell file ({e.ext}): {leak}")
+    elif e.name == "desktop.ini" and e.text and NETWORK_PATH_RE.search(e.text):
+        yield Finding(HIGH, f"desktop.ini pointing at a network path: {leak}")
 
 
 @rule
