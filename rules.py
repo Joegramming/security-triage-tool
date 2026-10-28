@@ -112,6 +112,10 @@ TEXT_PATTERN_KEYWORDS = {
 }
 # re.I matches \u0130 and \u0131 as i and \u017f as s, but str.lower() doesn't: map them so the prefilter never skips a match
 KEYWORD_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i", "\u017f": "s"})
+# Files AI coding agents read on their own as instructions (besides Cursor rules): a line telling the agent to
+# run something is prompt injection. Names are matched lowercased; dirs as path fragments.
+AGENT_INSTRUCTION_NAMES = {"claude.md", "claude.local.md", "agents.md", "gemini.md", ".windsurfrules", ".clinerules"}
+AGENT_INSTRUCTION_PATHS = ("/.github/copilot-instructions.md", "/.github/instructions/", "/.clinerules/", "/.windsurf/rules/")
 AGENT_RUN_RE = re.compile(
     r"\b(run|execute|exec|invoke|launch)\b[^\n]{0,60}"
     r"\b(command|script|shell|terminal|bash|cmd|powershell|pwsh|curl|wget|npm|npx|node|python)\b", re.I)
@@ -246,6 +250,13 @@ def decode_escapes(text: str) -> str:
     return ESCAPE_RE.sub(char, text)
 
 
+def line_of(text: str, m: re.Match) -> str:
+    """The line containing a match, trimmed, for quoting in a finding."""
+    start = text.rfind("\n", 0, m.start()) + 1
+    end = text.find("\n", m.end())
+    return text[start:end if end >= 0 else len(text)].strip()[:150]
+
+
 def text_pattern_hits(text: str) -> list[str]:
     """Names of the TEXT_PATTERNS found in text; the keyword prefilter skips most regex passes on normal files."""
     folded = (text if text.isascii() else text.translate(KEYWORD_FOLD)).lower()
@@ -354,14 +365,24 @@ def ai_agent_config(e):
     gemini = ".gemini" in e.parts[:-1]
     cursor = "/.cursor/rules/" in "/" + e.key or e.name == ".cursorrules"
     mcp = e.name == ".mcp.json" or e.parts[-2:] in ([".cursor", "mcp.json"], [".vscode", "mcp.json"])
-    if not (claude or gemini or cursor or mcp) or not e.text:
+    instructions = (not e.is_dir and (e.name in AGENT_INSTRUCTION_NAMES
+                                      or any(p in "/" + e.key for p in AGENT_INSTRUCTION_PATHS)))
+    if not (claude or gemini or cursor or mcp or instructions) or not e.text:
         return  # check the path first: unescaping every text file costs seconds on escape-packed input
     text = decode_escapes(e.text)
     if (claude or gemini) and (m := AGENT_COMMAND_KEYS_RE.search(text)):
         tool = "Claude Code settings" if claude else "Gemini CLI config"
         yield Finding(HIGH, f"{tool} with {m[1]!r}: runs shell commands automatically during an AI session")
-    if cursor and (AGENT_RUN_RE.search(text) or text_pattern_hits(text)):
-        yield Finding(HIGH, "Cursor rule file that tells the AI agent to run commands")
+    if cursor or instructions:
+        downloads = text_pattern_hits(text)
+        m = AGENT_RUN_RE.search(text) or (downloads and TEXT_PATTERNS[downloads[0]].search(text))
+        if m:
+            # Cursor rules are HIGH for any hit (spec). Other instruction files often say "run npm test", so a plain
+            # run instruction is MEDIUM there and only download-and-run style content is HIGH. Quote the line either way.
+            severity = HIGH if cursor or downloads else MEDIUM
+            kind = "Cursor rule file" if cursor else "AI agent instruction file"
+            extra = f" ({', '.join(downloads)})" if downloads else ""
+            yield Finding(severity, f"{kind} tells the AI agent to run commands{extra}: {line_of(text, m)!r}")
     if (mcp or gemini and '"mcpServers"' in text) and '"command"' in text:
         yield Finding(MEDIUM, "MCP server config: launches local commands when an AI tool opens this folder")
 

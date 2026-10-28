@@ -28,6 +28,7 @@ MAX_TOTAL_BYTES = 500 * 2**20  # everything decompressed in one run, nested arch
 MAX_FILE_BYTES = 50 * 2**20    # content read per entry
 MAX_ENTRIES = 20_000           # per run, nested archives included (per archive would multiply with nesting)
 MAX_DEPTH = 3                  # nested zips
+COLLAPSE_AT = 5                # text report: more findings than this with the same reason become one line
 DISCLAIMER = "No findings does not mean safe. Never open repos received as files; fresh-clone from a GitHub link instead."
 
 
@@ -257,12 +258,23 @@ def render_text(report: dict) -> str:
     out = [f"Triage report: {printable(report['file'])}"]
     for sev in (HIGH, MEDIUM):
         group = [f for f in report["findings"] if f["severity"] == sev]
-        if group:
-            out += ["", f"{sev} ({len(group)})"]
-            for f in group:
+        if not group:
+            continue
+        by_reason = {}
+        for f in group:
+            by_reason.setdefault(f["reason"], []).append(f)
+        out += ["", f"{sev} ({len(group)})"]
+        # Individual findings first: hundreds of identical ".js" lines must not bury a git hook below them
+        for f in group:
+            if len(by_reason[f["reason"]]) <= COLLAPSE_AT:
                 out += [f"  {printable(f['path'])}", f"      {printable(f['reason'])}"]
                 if f["sha256"]:
                     out.append(f"      sha256 {f['sha256']}")
+        for reason, same in by_reason.items():
+            if len(same) > COLLAPSE_AT:
+                examples = ", ".join(printable(f["path"]) for f in same[:3])
+                out += [f"  {len(same):,} entries: {printable(reason)}",
+                        f"      e.g. {examples}, ... (every path and SHA256 is in --json)"]
     if not report["findings"]:
         out += ["", "No HIGH or MEDIUM findings."]
     out += ["", "INFO", f"  Archive SHA256: {report['sha256']}", f"  Archive size: {report['size_bytes']:,} bytes"]
