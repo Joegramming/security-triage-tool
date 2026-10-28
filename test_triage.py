@@ -277,9 +277,14 @@ def test_npmrc_keys_hidden_behind_odd_whitespace_or_quotes():
     files = {f"{i}/.npmrc": "registry=https://registry.npmjs.org/\n" + p + "script-shell=./x.exe\n"
              for i, p in enumerate(prefixes.values())}
     files["q/.npmrc"] = '"script-shell" = ./x.exe\n'
-    f = scan(files)
+    bs = chr(92)  # backslash, built at runtime so no escaping layer can mangle the escapes under test
+    files["e/.npmrc"] = '"script' + bs + 'u002dshell"=./x.exe\n'  # npm JSON-decodes quoted keys
+    files["a/.npmrc"] = "script-shell[]=./x.exe\n"  # array-style key, also read by npm
+    f = scan(files | {"y1/.yarnrc.yml": "{yarnPath: ./x.cjs}\n",  # YAML flow mapping on one line
+                      "y2/.yarnrc.yml": '"' + bs + 'x79arnPath": ./x.cjs\n'})  # YAML escape for "y"
     for path in files:
         assert has(f, MEDIUM, path, "script-shell"), path
+    assert has(f, MEDIUM, "y1/.yarnrc.yml", "yarnPath") and has(f, MEDIUM, "y2/.yarnrc.yml", "yarnPath")
 
 
 def test_suspicious_text_patterns():

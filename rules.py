@@ -46,14 +46,13 @@ UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 BIDI_CHARS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f")
 NPM_LIFECYCLE_SCRIPTS = {"preinstall", "install", "postinstall", "prepare"}
 # Package-manager config keys that run a program on every command or install (file name -> key pattern).
-# npm's ini parser trims all whitespace (incl. form feed, no-break space, BOM) and unquotes keys, so match all
-# of it. Never \s*: with re.M it crosses newlines, and every line start would rescan all following blank lines.
-LINE_SPACE = r"(?:[^\S\r\n]|\N{ZERO WIDTH NO-BREAK SPACE})*"  # whitespace except line breaks, plus BOM
+# Matched as words anywhere in the escape-decoded file, not per line: npm's ini parser trims odd whitespace and
+# JSON-decodes quoted keys, and YAML allows flow mappings and escaped characters, so line-based patterns were
+# bypassable. A comment merely mentioning a key also matches, which is fine for a MEDIUM.
 PACKAGE_MANAGER_RUNNERS = {
-    ".yarnrc.yml": re.compile("^" + LINE_SPACE + r"[\"']?(yarnPath|plugins)[\"']?" + LINE_SPACE + ":", re.M | re.I),
-    ".yarnrc": re.compile("^" + LINE_SPACE + r"[\"']?(yarn-path)\b", re.M | re.I),
-    ".npmrc": re.compile("^" + LINE_SPACE + r"[\"']?(script-shell|node-options|onload-script)[\"']?" + LINE_SPACE + "=",
-                         re.M | re.I),
+    ".yarnrc.yml": re.compile(r"\b(yarnPath|plugins)\b", re.I),
+    ".yarnrc": re.compile(r"\b(yarn-path)\b", re.I),
+    ".npmrc": re.compile(r"\b(script-shell|node-options|onload-script)\b", re.I),
 }
 
 # (section, key) -> why it's dangerous. key "*" matches any key in that section.
@@ -122,7 +121,7 @@ FOLDER_OPEN_RE = re.compile(r'"folderOpen"', re.I)
 AGENT_COMMAND_KEYS_RE = re.compile(
     r"""["']?(hooks|statusLine|apiKeyHelper|awsAuthRefresh|awsCredentialExport|otelHeadersHelper"""
     r"""|toolDiscoveryCommand|toolCallCommand)["']?\s*[:=]""", re.I)
-JSON_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+ESCAPE_RE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|U([0-9a-fA-F]{8}))")  # JSON, YAML, ini escapes
 SHORT_NAME_RE = re.compile(r"[^.~]{1,6}~\d{1,6}(\.[^.]{0,3})?")  # 8.3 short name: up to 6 chars, ~N, optional 3-char ext
 # Anchored with ^: used with .match() per line anyway, and this keeps them linear even under .search()
 GIT_SECTION_RE = re.compile(r'^\s*\[\s*([^\]\s"]+)\s*(?:"(?:[^"\\]|\\.)*")?\s*\](.*)')
@@ -238,9 +237,13 @@ def git_config_items(text: str):
             yield section, m[1].lower(), (m[2] or "").strip()
 
 
-def unescape_json(text: str) -> str:
-    """Undo \\uXXXX escapes so "run\\u004fn" can't dodge the regexes."""
-    return JSON_ESCAPE_RE.sub(lambda m: chr(int(m[1], 16)), text)
+def decode_escapes(text: str) -> str:
+    """Undo the 4-hex, 2-hex and 8-hex backslash escapes of JSON, YAML and npm's ini, so an escaped key name
+    can't dodge the regexes. Escapes outside strings get decoded too, which only makes matching stricter."""
+    def char(m):
+        code = int(m[1] or m[2] or m[3], 16)
+        return chr(code) if code <= 0x10FFFF else "?"
+    return ESCAPE_RE.sub(char, text)
 
 
 def text_pattern_hits(text: str) -> list[str]:
@@ -341,7 +344,7 @@ def git_config(e):
 @rule
 def vscode_folder_open_task(e):
     if (("/" + e.key).endswith("/.vscode/tasks.json") or e.ext == ".code-workspace") and e.text \
-            and FOLDER_OPEN_RE.search(unescape_json(e.text)):
+            and FOLDER_OPEN_RE.search(decode_escapes(e.text)):
         yield Finding(HIGH, 'VS Code task with "runOn": "folderOpen": runs a command as soon as the folder is opened')
 
 
@@ -353,7 +356,7 @@ def ai_agent_config(e):
     mcp = e.name == ".mcp.json" or e.parts[-2:] in ([".cursor", "mcp.json"], [".vscode", "mcp.json"])
     if not (claude or gemini or cursor or mcp) or not e.text:
         return  # check the path first: unescaping every text file costs seconds on escape-packed input
-    text = unescape_json(e.text)
+    text = decode_escapes(e.text)
     if (claude or gemini) and (m := AGENT_COMMAND_KEYS_RE.search(text)):
         tool = "Claude Code settings" if claude else "Gemini CLI config"
         yield Finding(HIGH, f"{tool} with {m[1]!r}: runs shell commands automatically during an AI session")
@@ -416,7 +419,7 @@ def package_manager_configs(e):
         return
     if e.name in (".pnpmfile.cjs", ".pnpmfile.mjs"):
         yield Finding(MEDIUM, f"{e.name}: pnpm runs this code on every install")
-    elif (rx := PACKAGE_MANAGER_RUNNERS.get(e.name)) and e.text and (m := rx.search(e.text)):
+    elif (rx := PACKAGE_MANAGER_RUNNERS.get(e.name)) and e.text and (m := rx.search(decode_escapes(e.text))):
         yield Finding(MEDIUM, f"{e.name} sets {m[1]!r}: runs a program on every package-manager command")
 
 
