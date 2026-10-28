@@ -271,6 +271,17 @@ def test_package_manager_configs_that_run_code():
     assert not any(x.path in ("c/.npmrc", "d/.yarnrc.yml") for x in f)
 
 
+def test_npmrc_keys_hidden_behind_odd_whitespace_or_quotes():
+    # npm's own ini parser reads every one of these as script-shell (checked against npm's bundled ini module)
+    prefixes = {"form feed": chr(12), "vertical tab": chr(11), "no-break space": chr(0xa0), "BOM": chr(0xfeff)}
+    files = {f"{i}/.npmrc": "registry=https://registry.npmjs.org/\n" + p + "script-shell=./x.exe\n"
+             for i, p in enumerate(prefixes.values())}
+    files["q/.npmrc"] = '"script-shell" = ./x.exe\n'
+    f = scan(files)
+    for path in files:
+        assert has(f, MEDIUM, path, "script-shell"), path
+
+
 def test_suspicious_text_patterns():
     f = scan({"a.sh": "curl -s https://example.invalid/x | bash",
               "b.txt": "powershell -enc " + "A" * 40,
@@ -329,7 +340,8 @@ def test_every_regex_stays_fast_on_crafted_input():
     patterns += [v for d in vars(rules).values() if isinstance(d, dict) for v in d.values() if isinstance(v, re.Pattern)]
     words = "curl wget bash sh sudo powershell pwsh iex node python py atob eval hooks yarnPath script-shell folderOpen"
     inputs = ["\n" * 100_000, " " * 100_000, "\t\n" * 50_000, "a" * 100_000, "A" * 299 + " " * 50_000, "|" * 100_000,
-              "\\\\" * 50_000, "//a" * 30_000, ("curl|" * 20_000), " -a" * 30_000, "[core]" * 15_000]
+              "\\\\" * 50_000, "//a" * 30_000, ("curl|" * 20_000), " -a" * 30_000, "[core]" * 15_000,
+              (chr(11) + chr(12) + chr(0xa0) + chr(0xfeff)) * 25_000, (chr(12) * 50 + "\n") * 2_000]
     inputs += [(w + " ") * (100_000 // (len(w) + 1)) for w in words.split()]
     assert len(patterns) > 15  # sanity: the module scan found the patterns
     for rx in patterns:
@@ -460,6 +472,23 @@ def test_corrupted_archives_flagged_not_crashing():
     assert has(scan(make_zip({"a.txt": "hello"})[:-10]), HIGH, "test.zip", "corrupted")
     bad_crc = make_zip({".vscode/tasks.json": '{"runOn":"folderOpen"}'}, zipfile.ZIP_STORED).replace(b"runOn", b"runOm")
     assert has(scan(bad_crc), HIGH, ".vscode/tasks.json", "could not read")
+
+
+def with_bad_end_record(data):
+    """Claim a huge central directory: zipfile.is_zipfile then raises ValueError (negative seek) instead of
+    answering no. Found by fuzzing."""
+    i = data.rfind(b"PK\x05\x06")
+    return data[:i + 12] + struct.pack("<I", 0x7FFFFFFF) + data[i + 16:]
+
+
+def test_crafted_end_record_does_not_crash_the_scan():
+    # In memory (nested entries, joined-zip check) is_zipfile raises ValueError; on a real file the same seek
+    # raises OSError, which is_zipfile already catches, so top-level files were never affected.
+    bad = with_bad_end_record(make_zip({"a.txt": "hello"}))
+    f = scan({"repo/.git/hooks/post-checkout": "echo test", "x.bin": bad})
+    assert has(f, HIGH, "repo/.git/hooks/post-checkout", "hook")  # the rest of the report survives
+    assert has(f, HIGH, "x.bin", "corrupted")
+    assert has(scan(bad + make_zip({"README.md": "hi"})), HIGH, "test.zip", "joined")  # joined-zip path too
 
 
 def test_password_protected_flagged():

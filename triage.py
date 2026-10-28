@@ -74,6 +74,15 @@ def read_entry(zf, info, scan, where):
     return data, False
 
 
+def looks_like_zip(source):
+    """zipfile.is_zipfile, except that input which makes it raise counts as a zip, so it gets opened and
+    flagged as corrupted instead of crashing the scan (a crafted end record gives ValueError: negative seek)."""
+    try:
+        return zipfile.is_zipfile(source)
+    except Exception:
+        return True
+
+
 def unicode_path_name(info):
     """Name from an Info-ZIP Unicode Path extra field (0x7075). Parsed here because Python 3.11's zipfile
     ignores it and 3.12+ ignores it when its checksum doesn't match, while other tools (e.g. 7-Zip) may use it."""
@@ -138,7 +147,7 @@ def scan_zip(source, scan, label, prefix="", depth=0):
                 scan.add(f)
             # is_zipfile finds the archive from its end, like zip tools do, so junk prepended to a zip
             # (or a zip appended to an image or .exe) can't hide it
-            if data and (entry.ext == ".zip" or zipfile.is_zipfile(io.BytesIO(data))):
+            if data and (entry.ext == ".zip" or looks_like_zip(io.BytesIO(data))):
                 if depth < MAX_DEPTH:
                     scan_zip(io.BytesIO(data), scan, prefix + entry.path, prefix + entry.path + "!/", depth + 1)
                 else:
@@ -162,7 +171,7 @@ def scan_joined_archive(zf, infos, scan, label, prefix, depth):
     zf.fp.seek(0)
     head = zf.fp.read(start)
     scan.bytes_read += len(head)
-    if zipfile.is_zipfile(io.BytesIO(head)):
+    if looks_like_zip(io.BytesIO(head)):
         scan.add(Finding(HIGH, "Two zip archives joined into one file: tools disagree on which one they show "
                                "(the first one's findings are listed under (first archive)!/)", label))
         if depth < MAX_DEPTH:
@@ -276,7 +285,7 @@ def main(argv=None) -> int:
     if not path.is_file():
         print(f"error: {args.file} is not a file", file=sys.stderr)
         return 2
-    if path.suffix.lower() != ".zip" and not zipfile.is_zipfile(path):
+    if path.suffix.lower() != ".zip" and not looks_like_zip(path):
         print("error: unsupported file type; only .zip archives are supported for now", file=sys.stderr)
         return 2
     try:

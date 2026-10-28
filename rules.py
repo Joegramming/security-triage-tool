@@ -46,11 +46,14 @@ UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 BIDI_CHARS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f")
 NPM_LIFECYCLE_SCRIPTS = {"preinstall", "install", "postinstall", "prepare"}
 # Package-manager config keys that run a program on every command or install (file name -> key pattern).
-# [ \t]* not \s*: with re.M, \s* crosses newlines, so every line start would rescan all following blank lines.
+# npm's ini parser trims all whitespace (incl. form feed, no-break space, BOM) and unquotes keys, so match all
+# of it. Never \s*: with re.M it crosses newlines, and every line start would rescan all following blank lines.
+LINE_SPACE = r"(?:[^\S\r\n]|\N{ZERO WIDTH NO-BREAK SPACE})*"  # whitespace except line breaks, plus BOM
 PACKAGE_MANAGER_RUNNERS = {
-    ".yarnrc.yml": re.compile(r"^[ \t]*(yarnPath|plugins)[ \t]*:", re.M | re.I),
-    ".yarnrc": re.compile(r"^[ \t]*(yarn-path)\b", re.M | re.I),
-    ".npmrc": re.compile(r"^[ \t]*(script-shell|node-options|onload-script)[ \t]*=", re.M | re.I),
+    ".yarnrc.yml": re.compile("^" + LINE_SPACE + r"[\"']?(yarnPath|plugins)[\"']?" + LINE_SPACE + ":", re.M | re.I),
+    ".yarnrc": re.compile("^" + LINE_SPACE + r"[\"']?(yarn-path)\b", re.M | re.I),
+    ".npmrc": re.compile("^" + LINE_SPACE + r"[\"']?(script-shell|node-options|onload-script)[\"']?" + LINE_SPACE + "=",
+                         re.M | re.I),
 }
 
 # (section, key) -> why it's dangerous. key "*" matches any key in that section.
