@@ -82,7 +82,7 @@ def test_ntfs_stream_syntax_is_resolved_and_flagged():
 
 def test_bare_repo_and_gitdir_pointer():
     f = scan({"proj/.git": "gitdir: ../hidden", "hidden/HEAD": "ref", "hidden/config": "[core]\n",
-              "hidden/objects/x": "", "hidden/hooks/post-checkout": "echo x"})
+              "hidden/objects/x": "", "hidden/refs/heads/main": "x", "hidden/hooks/post-checkout": "echo x"})
     assert has(f, HIGH, "proj/.git", "gitdir")
     assert has(f, HIGH, "hidden/", "bare git repository")
     assert has(f, HIGH, "hidden/hooks/post-checkout", "hook")
@@ -93,6 +93,16 @@ def test_bare_repo_without_config_still_detected():
               "hidden/hooks/post-checkout": "echo test"})
     assert has(f, HIGH, "hidden/", "bare git repository")
     assert has(f, HIGH, "hidden/hooks/post-checkout", "hook")
+
+
+def test_git_dir_signatures_match_git():
+    # worktree-style gitdir (HEAD + commondir) whose hooks live in the common dir (objects/ + refs/, no HEAD)
+    f = scan({"proj/.git": "gitdir: ../wt", "wt/HEAD": "ref", "wt/commondir": "../common",
+              "common/objects/x": "", "common/refs/heads/main": "x", "common/hooks/post-checkout": "echo test",
+              "r/.git/logs/HEAD": "x", "r/.git/logs/refs/heads/main": "x"})
+    assert has(f, HIGH, "wt/", "bare git repository") and has(f, HIGH, "common/", "bare git repository")
+    assert has(f, HIGH, "common/hooks/post-checkout", "hook")
+    assert not any(x.path == "r/.git/logs/" for x in f)  # HEAD + refs/ alone is git's log folder, not a repo
 
 
 def test_dangerous_git_config():
@@ -372,7 +382,8 @@ def test_every_regex_stays_fast_on_crafted_input():
     # 20,000 blank lines took 5 s. Each input is ~100 KB, so a quadratic pattern takes far longer than the limit.
     patterns = [v for v in vars(rules).values() if isinstance(v, re.Pattern)]
     patterns += [v for d in vars(rules).values() if isinstance(d, dict) for v in d.values() if isinstance(v, re.Pattern)]
-    words = "curl wget bash sh sudo powershell pwsh iex node python py atob eval hooks yarnPath script-shell folderOpen"
+    words = ("curl wget bash sh sudo powershell pwsh iex node python py atob eval hooks yarnPath script-shell folderOpen"
+             " run execute")
     inputs = ["\n" * 100_000, " " * 100_000, "\t\n" * 50_000, "a" * 100_000, "A" * 299 + " " * 50_000, "|" * 100_000,
               "\\\\" * 50_000, "//a" * 30_000, ("curl|" * 20_000), " -a" * 30_000, "[core]" * 15_000,
               (chr(11) + chr(12) + chr(0xa0) + chr(0xfeff)) * 25_000, (chr(12) * 50 + "\n") * 2_000]

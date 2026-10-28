@@ -210,7 +210,7 @@ class Entry:
 
 def annotate_git_dirs(entries: list[Entry]) -> None:
     """Set git_depth on entries inside anything git treats as a repository: a .git folder,
-    or a bare-repo layout (HEAD + objects/ or refs/), which is how a .git file's gitdir: target looks.
+    or a bare-repo layout (objects/ + refs/, or HEAD + commondir), which is how a .git file's gitdir: target looks.
     Folders get integer ids so hostile, very deep paths cost linear time instead of one string per prefix."""
     ids = {}               # (parent id, part) -> folder id; 0 is the archive root
     names = {0: ""}        # folder id -> its own name
@@ -227,9 +227,10 @@ def annotate_git_dirs(entries: list[Entry]) -> None:
         if not e.is_dir and e.parts:
             children[fid].add(e.parts[-1])
         chains.append(chain)
-    # git itself needs HEAD + objects/ + refs/ and treats config as optional, so don't require config
+    # git's own signatures: objects/ + refs/ (a common dir, where hooks live, needs no HEAD), or HEAD + commondir
+    # (a worktree-style gitdir pointing at that common dir). Config is optional; .git/logs (HEAD + refs/) is not one.
     git = {fid for fid, c in children.items()
-           if names[fid] == ".git" or "head" in c and ("objects/" in c or "refs/" in c)}
+           if names[fid] == ".git" or "objects/" in c and "refs/" in c or "head" in c and "commondir" in c}
     for e, chain in zip(entries, chains):
         e.git_depth = max((depth for depth, fid in enumerate(chain) if fid in git), default=None)
 
@@ -333,7 +334,8 @@ def git_repository(e):
     if (depth := e.git_depth) is not None:
         what = (".git directory: git commands run in this folder (including VS Code's automatic ones) obey its hooks and config"
                 if depth and e.parts[depth - 1] == ".git" else
-                "Bare git repository layout (HEAD with objects/ or refs/): git treats this folder as a repository")
+                "Bare git repository layout (objects/ and refs/, or HEAD with commondir): git treats this folder as a "
+                "repository")
         yield Finding(HIGH, what, path=e.dir_path(depth))
     if e.name == ".git" and not e.is_dir:
         yield Finding(HIGH, ".git file (gitdir: pointer): can redirect git to a repository hidden elsewhere")
